@@ -1,6 +1,5 @@
 import logging
 import os
-from datetime import datetime
 from typing import Any, AsyncGenerator, Optional, Sequence, TypedDict
 
 import litellm
@@ -15,7 +14,6 @@ from databricks_langchain import (
 from fastapi import HTTPException
 from langchain.agents import create_agent
 from langchain_core.messages import AnyMessage
-from langchain_core.tools import tool
 from langgraph.graph.message import add_messages
 from mlflow.genai.agent_server import invoke, stream
 from mlflow.types.responses import (
@@ -26,6 +24,7 @@ from mlflow.types.responses import (
 )
 from typing_extensions import Annotated
 
+from agent_server.tools import get_customer_key, get_invoice_info, list_invoices
 from agent_server.utils import (
     _get_lakebase_access_error_message,
     _get_or_create_thread_id,
@@ -40,33 +39,55 @@ litellm.suppress_debug_info = True
 sp_workspace_client = WorkspaceClient()
 
 
-@tool
-def get_current_time() -> str:
-    """Get the current date and time."""
-    return datetime.now().isoformat()
-
-
 ############################################
 # Configuration
 ############################################
 LLM_ENDPOINT_NAME = "databricks-claude-sonnet-4-5"
-SYSTEM_PROMPT = "You are a helpful assistant. Use the available tools to answer questions."
-LAKEBASE_INSTANCE_NAME = os.getenv("LAKEBASE_INSTANCE_NAME") or None
-LAKEBASE_AUTOSCALING_PROJECT = os.getenv("LAKEBASE_AUTOSCALING_PROJECT") or None
-LAKEBASE_AUTOSCALING_BRANCH = os.getenv("LAKEBASE_AUTOSCALING_BRANCH") or None
+SYSTEM_PROMPT = """You are a call center assistant that helps representatives resolve customer complaints \
+related to their monthly invoices. You only have access to invoices from the last 3 months.
 
-_has_autoscaling = LAKEBASE_AUTOSCALING_PROJECT and LAKEBASE_AUTOSCALING_BRANCH
-if not LAKEBASE_INSTANCE_NAME and not _has_autoscaling:
+Follow this workflow:
+1. The representative will provide a customer identifier: either a phone number or an identification number.
+2. Use the get_customer_key tool to look up the customer key based on the identifier provided. \
+   This stores the customer key in the session so all subsequent tools use it automatically.
+3. Once the customer is identified, use list_invoices to show the available invoices. \
+   You do NOT need to pass the customer key — it is read from the session automatically.
+4. Use get_invoice_info to retrieve detailed information about a specific invoice when needed. \
+   Again, the customer key is automatic — just pass the invoice key.
+
+IMPORTANT - Customer identification is mandatory:
+- If the representative asks about an invoice or any customer-related information WITHOUT first providing \
+  a phone number or identification number, you MUST ask them to provide one before proceeding. \
+  Do NOT attempt to call list_invoices or get_invoice_info without first having identified the customer \
+  through get_customer_key.
+- Example response: "Before I can look up invoice information, I need the customer's identification number \
+  or phone number. Could you provide one of those?"
+
+Customer switch:
+- If the representative provides a NEW phone number or identification number during the conversation, \
+  call get_customer_key again to switch to the new customer. This updates the session automatically.
+
+Guidelines:
+- Always start by identifying the customer before looking up invoices.
+- Be concise and focused on resolving the complaint.
+- If a customer or invoice is not found, let the representative know clearly.
+"""
+
+LAKEBASE_ENDPOINT = os.getenv("LAKEBASE_ENDPOINT") or None
+LAKEBASE_INSTANCE_NAME = os.getenv("LAKEBASE_INSTANCE_NAME") or None
+
+if not LAKEBASE_ENDPOINT and not LAKEBASE_INSTANCE_NAME:
     raise ValueError(
         "Lakebase configuration is required but not set. "
         "Please set one of the following in your environment:\n"
-        "  Option 1 (provisioned): LAKEBASE_INSTANCE_NAME=<your-instance-name>\n"
-        "  Option 2 (autoscaling): LAKEBASE_AUTOSCALING_PROJECT=<project> and LAKEBASE_AUTOSCALING_BRANCH=<branch>\n"
+        "  Option 1 (autoscaling): LAKEBASE_ENDPOINT (auto-injected via value_from postgres resource)\n"
+        "  Option 2 (provisioned): LAKEBASE_INSTANCE_NAME=<your-instance-name>\n"
     )
 
 
 class StatefulAgentState(TypedDict, total=False):
     messages: Annotated[Sequence[AnyMessage], add_messages]
+    customer_key: Optional[str]
     custom_inputs: dict[str, Any]
     custom_outputs: dict[str, Any]
 
@@ -88,7 +109,7 @@ async def init_agent(
     workspace_client: Optional[WorkspaceClient] = None,
     checkpointer: Optional[Any] = None,
 ):
-    tools = [get_current_time]
+    tools = [get_customer_key, list_invoices, get_invoice_info]
     # To use MCP server tools instead, uncomment the below lines:
     # mcp_client = init_mcp_client(workspace_client or sp_workspace_client)
     # try:
@@ -147,9 +168,8 @@ async def stream_handler(
 
     try:
         async with AsyncCheckpointSaver(
+            autoscaling_endpoint=LAKEBASE_ENDPOINT,
             instance_name=LAKEBASE_INSTANCE_NAME,
-            project=LAKEBASE_AUTOSCALING_PROJECT,
-            branch=LAKEBASE_AUTOSCALING_BRANCH,
         ) as checkpointer:
             await checkpointer.setup()
             # By default, uses service principal credentials.
@@ -169,7 +189,7 @@ async def stream_handler(
         # Check for Lakebase access/connection errors
         if any(keyword in error_msg for keyword in ["lakebase", "pg_hba", "postgres", "database instance"]):
             logger.error(f"Lakebase access error: {e}")
-            lakebase_desc = LAKEBASE_INSTANCE_NAME or f"{LAKEBASE_AUTOSCALING_PROJECT}/{LAKEBASE_AUTOSCALING_BRANCH}"
+            lakebase_desc = LAKEBASE_INSTANCE_NAME or LAKEBASE_ENDPOINT
             raise HTTPException(
                 status_code=503, detail=_get_lakebase_access_error_message(lakebase_desc)
             ) from e
